@@ -1,0 +1,67 @@
+name: sui
+# Prueba de humo: decompila TabletUI.apk (solo recursos, el dex queda intacto), lo reconstruye sin cambios,
+# lo alinea, lo firma y lo empaqueta como modulo Magisk. Poner en .github/workflows/ y subir al repo
+# TabletUI.apk y framework-res.apk (los de la GSI) como assets de un release llamado 'src' (GitHub permite hasta 2 GB por asset; el repo no).
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/cache@v4
+        with:
+          path: sui.jks
+          key: sui-jks-v1
+      - name: Apktool mas reciente
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download --repo iBotPeaches/Apktool --pattern 'apktool_*.jar' --output apktool.jar --clobber
+          java -jar apktool.jar --version
+      - name: Bajar APK de origen
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download src --pattern 'TabletUI.apk' --pattern 'framework-res.apk' --clobber
+          ls -la *.apk
+      - name: Decompilar y reconstruir
+        run: |
+          java -jar apktool.jar if framework-res.apk
+          java -jar apktool.jar d -s -f TabletUI.apk -o sui
+          # aqui van luego las ediciones de recursos en sui/res
+          java -jar apktool.jar b sui -o SystemUI_raw.apk
+      - name: Alinear y firmar
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          [ -f sui.jks ] || keytool -genkeypair -keystore sui.jks -storepass holo123 -keypass holo123 -alias k -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Holo"
+          $BT/zipalign -f -p 4 SystemUI_raw.apk SystemUI_aligned.apk
+          $BT/apksigner sign --ks sui.jks --ks-pass pass:holo123 --key-pass pass:holo123 --out SystemUI.apk SystemUI_aligned.apk
+          $BT/apksigner verify SystemUI.apk
+      - name: Modulo Magisk
+        run: |
+          D=mod/system/system_ext/priv-app/SystemUI
+          mkdir -p $D mod/META-INF/com/google/android
+          cp SystemUI.apk $D/SystemUI.apk
+          printf 'id=holosui\nname=Holo SystemUI\nversion=smoke\nversionCode=1\nauthor=adriano\ndescription=SystemUI A16 reconstruido\n' > mod/module.prop
+          printf '#!/system/bin/sh\nMODDIR=${0%%/*}\nwhile [ "$(getprop sys.boot_completed)" != 1 ]; do sleep 5; done\nsleep 40\n[ -f /data/local/tmp/holosui_done ] || { cmd package compile -m speed -f com.android.systemui && touch /data/local/tmp/holosui_done; }\n' > mod/service.sh
+          echo '#MAGISK' > mod/META-INF/com/google/android/updater-script
+          echo 'Magisk' > /dev/null
+          curl -fsSL -o mod/META-INF/com/google/android/update-binary https://raw.githubusercontent.com/topjohnwu/Magisk/master/scripts/module_installer.sh
+          (cd mod && zip -r ../HoloSystemUI.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HoloSystemUI
+          path: HoloSystemUI.zip
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view sui >/dev/null 2>&1 || gh release create sui --title sui --notes smoke
+          gh release upload sui HoloSystemUI.zip --clobber
